@@ -1,0 +1,254 @@
+/**
+ * Created by x075842 on 3/17/2016.
+ */
+
+fs = require('fs');
+THREE = require('three');
+
+var Canvas = require('canvas');
+var Image = Canvas.Image;
+
+
+GSV = {};
+
+GSV.PointCloud = function(lat, lng) {
+    this.base_lat = lat;
+    this.base_lng = lng;
+    this.num_points = 0;
+    this.cur_depth_elem = 0;
+    this.all_images = [];
+
+
+};
+
+GSV.PointCloud.prototype.lat_lng_diff = function(lat1, lng1, lat2, lng2) {
+    var radius = 6378.137;
+    var lat_diff = (lat2 - lat1) * Math.PI / 180;
+    var lng_diff = (lng2 - lng1) * Math.PI / 180;
+    var arc = Math.sin(lat_diff / 2) * Math.sin(lat_diff / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(lng_diff / 2) * Math.sin(lng_diff / 2);
+    var c = 2 * Math.atan2(Math.sqrt(arc), Math.sqrt(1 - arc));
+    var d = radius * c;
+    return d * 1000;
+};
+
+GSV.PointCloud.prototype.save = function(path) {
+
+
+    var ply = "ply\nformat ascii 1.0\nelement vertex "+this.positions.length/3+"\nproperty float x\nproperty float y\nproperty float z\n";
+    //ply += "property float nx\nproperty float ny\nproperty float nz\nproperty float intensity\n";
+    ply += "property uchar diffuse_red\nproperty uchar diffuse_green\nproperty uchar diffuse_blue\nend_header\n";
+
+    console.log("saving point cloud to " + path);
+
+    fs.writeFileSync(path, ply);
+
+    var plyel = "";
+    for (var x = 0; x < this.positions.length; x+=3) {
+        if (x%999 == 0) {
+            if (plyel != "") fs.appendFileSync(path, plyel);
+            plyel = "";
+
+        }
+        var lim = 100000;
+        if (Math.abs(this.positions[x]) > lim || Math.abs(this.positions[x+1]) > lim || Math.abs(this.positions[x+2]) > lim) {
+            continue;
+        }
+
+        plyel += this.positions[x] + " " + this.positions[x+1] + " " + this.positions[x+2] + " ";
+       // plyel += 1 + " " + 1 + " " + 1 + " ";
+       // plyel += "1 ";
+        plyel += (isNaN(this.colors[x]) ? 0 : this.colors[x]) + " " +
+                (isNaN(this.colors[x+1]) ? 0 : this.colors[x+1]) + " " +
+                (isNaN(this.colors[x+2]) ? 0 : this.colors[x+2])+ "\n";
+
+    }
+
+    if (plyel != "") fs.appendFileSync(path, plyel);
+
+
+    console.log("all done");
+
+};
+
+GSV.PointCloud.prototype.getFromPath = function(path) {
+    var self = this;
+
+    this.num_points = 0;
+    this.cur_depth_elem = 0;
+
+    // load all files in path
+    fs.readdir(path, function(err, data) {
+        if (err) console.log(err);
+        // for each file
+        self.all_images = [];
+        for (var x = 0; x < data.length; x++) {
+            if (data[x].indexOf('.png') !== -1 && data[x].indexOf('.thumb') == -1) {
+                self.all_images.push(path + '/' + data[x]);
+            }
+        }
+
+        var lock = 0;
+        (p = function() {
+
+            // check if we are done
+            if (self.cur_depth_elem == self.all_images.length) {
+                self.save('data/pointcloud.ply');
+                return;
+            }
+
+            // load depth
+            fs.readFile(self.all_images[self.cur_depth_elem].replace('.png', '.depth'), function(err, data) {
+                if (err) {
+                    console.log(err);
+                    self.cur_depth_elem++;
+                    p();
+                }
+                else {
+                    var depthMap = JSON.parse(data);
+                    self.getSingleDepth(depthMap.depthMap, depthMap.data);
+
+                    fs.readFile(self.all_images[self.cur_depth_elem].replace('.png', '.thumb.png'), function(err, imgdata) {
+                        if (err) {
+                            console.log(err);
+                            self.cur_depth_elem++;
+                            p();
+                        }
+
+                        var img = new Canvas.Image;
+                        img.onload = function () {
+                            var canvas = new Canvas(img.width, img.height);
+                            var ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0, img.width, img.height);
+
+                            self.getSingleColor(ctx.getImageData(0, 0, img.width, img.height), img.width, img.height);
+                            self.cur_depth_elem++;
+                            p();
+                        };
+                        img.onerror = function(err) {
+                            console.log(err);
+                            self.cur_depth_elem++;
+                            p();
+                        };
+                        img.src = imgdata;
+
+
+
+                    });
+
+                }
+
+            });
+
+        })();
+
+    });
+
+
+};
+
+GSV.PointCloud.prototype.getSingleDepth = function(depthMap, data) {
+    if (this.num_points === 0) {
+
+        this.depthmap_width = depthMap.width;
+        this.depthmap_height = depthMap.height;
+
+        this.num_points = this.all_images.length * this.depthmap_width * this.depthmap_height;
+        this.positions = new Float32Array(this.num_points * 3);
+        this.colors = new Float32Array(this.num_points * 3);
+
+        if (typeof this.base_lng == "undefined") {
+            this.base_lat = data.Location.lat;
+            this.base_lng = data.Location.lng;
+        }
+    }
+
+    var axis = new THREE.Vector3(0, 1, 0);
+    var base_offset = this.cur_depth_elem * this.depthmap_width * this.depthmap_height;
+
+    var rotation = data.Projection.pano_yaw_deg;
+    var actual_lat = data.Location.lat;
+    var actual_lng = data.Location.lng;
+
+    var lat_diff = this.lat_lng_diff(this.base_lat, this.base_lng, actual_lat, this.base_lng);
+    var lng_diff = this.lat_lng_diff(this.base_lat, this.base_lng, this.base_lat, actual_lng);
+    var lat_sign = (this.base_lat - actual_lat) < 0.0 ? -1 : +1;
+    var lng_sign = (this.base_lng - actual_lng) < 0.0 ? -1 : +1;
+    var offset_x = lat_diff * -lat_sign;
+    var offset_y = 0; //elevation;
+    var offset_z = lng_diff * lng_sign;
+    var rot_y = rotation * Math.PI / 180.0;
+
+    for (var y = 0, num = 0; y < this.depthmap_height; y += 1) {
+
+        var lat = (y / this.depthmap_height) * 180.0 - 90.0;
+        var r = Math.cos(lat * Math.PI / 180.0);
+
+        for (var x = 0; x < this.depthmap_width; x += 1) {
+
+            var depth = parseFloat(depthMap.depthMap[y * this.depthmap_width + this.depthmap_width - x]);
+
+            if (depth > 1000000) depth = 1000000;
+            if (depth < 0) {
+                console.log(ups);
+            }
+
+            var lng = (1 - (x / this.depthmap_width)) * 360.0 - 180.0;
+            var pos = new THREE.Vector3();
+            pos.x = (r * Math.cos(lng * Math.PI / 180.0));
+            pos.y = (Math.sin(lat * Math.PI / 180.0));
+            pos.z = (r * Math.sin(lng * Math.PI / 180.0));
+
+            pos.multiplyScalar(depth);
+
+            var matrix = new THREE.Matrix4().makeRotationAxis(axis, rot_y);
+            pos.applyMatrix4(matrix);
+
+            if (pos.x > 1000 || pos.y > 1000 || pos.z > 1000) {
+                //console.log('ups');
+            }
+            if (Math.abs(pos.x) < 0.00000001 || Math.abs(pos.y) < 0.00000001 || Math.abs(pos.z) < 0.00000001) {
+                //console.log('ups');
+                if (Math.abs(pos.x) < 0.0001) pos.x = 0.00001;
+                if (Math.abs(pos.y) < 0.0001) pos.y = 0.00001;
+                if (Math.abs(pos.z) < 0.0001) pos.z = 0.00001;
+            }
+
+            pos.x += offset_x;
+            pos.y += offset_y;
+            pos.z += offset_z;
+
+            this.positions[base_offset * 3 + num * 3 + 0] = isNaN(pos.x) ? 0 : pos.x;
+            this.positions[base_offset * 3 + num * 3 + 1] = isNaN(pos.y) ? 0 : pos.y;
+            this.positions[base_offset * 3 + num * 3 + 2] = isNaN(pos.z) ? 0 : pos.z;
+
+            ++num;
+        }
+    }
+
+};
+
+GSV.PointCloud.prototype.getSingleColor = function(color_data, c_width, c_height) {
+    var base_offset = this.cur_depth_elem * this.depthmap_width * this.depthmap_height;
+
+    for (var y = 0, num = 0; y < this.depthmap_height; y++) {
+
+        var normalized_y = y / this.depthmap_height;
+
+        for (var x = 0; x < this.depthmap_width; x++) {
+
+            var normalized_x = (1 - x / this.depthmap_width);
+            var color_canvas_x = parseInt(normalized_x * c_width);
+            var color_canvas_y = parseInt(normalized_y * c_height);
+            var color_index = color_canvas_y * c_width * 4 + color_canvas_x * 4;
+            this.colors[base_offset * 3 + num * 3 + 0] = (color_data.data[color_index + 0]) ;
+            this.colors[base_offset * 3 + num * 3 + 1] = (color_data.data[color_index + 1]) ;
+            this.colors[base_offset * 3 + num * 3 + 2] = (color_data.data[color_index + 2]) ;
+
+            ++num;
+        }
+    }
+};
+
+module.exports = GSV.PointCloud;
